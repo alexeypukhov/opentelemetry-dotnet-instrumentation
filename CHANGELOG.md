@@ -44,7 +44,9 @@ This component adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - Invalid plugin type names no longer stop automatic instrumentation or crash
   .NET Framework applications unless fail-fast is enabled.
 - Support native profiler assembly redirection for
-  `UnsafeAccessorTypeAttribute` metadata on .NET 10 and later.
+  `UnsafeAccessorTypeAttribute` metadata on .NET 10 and later. Bound type-name
+  processing by input size, bracket count, and traversal work; attributes
+  exceeding these limits are left unchanged.
 
 ## [v1.17.0](https://github.com/open-telemetry/opentelemetry-dotnet-instrumentation/releases/tag/v1.17.0)
 
