@@ -1,8 +1,10 @@
 #include "pch.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 #include "../../src/OpenTelemetry.AutoInstrumentation.Native/string_utils.h"
+#include "../../src/OpenTelemetry.AutoInstrumentation.Native/type_name_assembly_reference_parser.h"
 #include "../../src/OpenTelemetry.AutoInstrumentation.Native/unsafe_accessor_type_attribute_blob_rewriter.h"
 #include "../../src/OpenTelemetry.AutoInstrumentation.Native/unsafe_accessor_type_attribute_updater.h"
 #include "../../src/OpenTelemetry.AutoInstrumentation.Native/type_name_assembly_redirection_rewriter.h"
@@ -14,7 +16,10 @@ namespace
 
 constexpr size_t one_byte_length_max       = 0x7F;
 constexpr size_t two_byte_length_max       = 0x3FFF;
-constexpr size_t max_generic_nesting_depth = 64;
+constexpr size_t deep_generic_nesting_depth = 256;
+constexpr size_t max_type_name_bytes        = 8 * 1024 * 1024;
+constexpr size_t max_bracket_groups         = 4096;
+constexpr size_t max_scheduled_types        = 8192;
 
 std::string WrapInGenericTypes(std::string type_name, const size_t depth)
 {
@@ -71,6 +76,242 @@ std::vector<BYTE> CreateUnsafeAccessorTypeAttributeBlob(const std::string& type_
 }
 
 } // namespace
+
+TEST(TypeNameSliceTest, PreservesSourceOffsetsAcrossSubstringsAndTrimming)
+{
+    const std::string   input = "prefix [  Leaf, Assembly, Version=1.2  ] suffix";
+    const TypeNameSlice root(input);
+    const auto          opening  = input.find('[');
+    const auto          closing  = input.find(']');
+    const auto          bracket  = root.Substr(opening, closing + 1 - opening);
+    const auto          contents = bracket.Substr(1, bracket.Size() - 2).Trimmed();
+    EXPECT_EQ(bracket.View(), "[  Leaf, Assembly, Version=1.2  ]");
+    EXPECT_EQ(bracket.Begin(), opening);
+    EXPECT_EQ(bracket.End(), closing + 1);
+    EXPECT_EQ(contents.View(), "Leaf, Assembly, Version=1.2");
+    EXPECT_EQ(contents.Begin(), input.find("Leaf"));
+
+    const auto version = contents.Substr(contents.View().find("1.2"), 3);
+    EXPECT_EQ(version.View(), "1.2");
+    EXPECT_EQ(version.Begin(), input.find("1.2"));
+    EXPECT_EQ(version.End(), input.find("1.2") + 3);
+    EXPECT_EQ(version.View().data(), input.data() + version.Begin());
+    EXPECT_EQ(root.View(), input);
+
+    // A child is bounded by its current region, even when the original source has more text beyond it.
+    EXPECT_THROW(contents.Substr(contents.Size() + 1), std::out_of_range);
+}
+
+TEST(TypeNameSliceTest, KeepsEmptySlicesAnchoredWithoutSubtractingNullPointers)
+{
+    const TypeNameSlice empty(std::string_view{});
+    EXPECT_TRUE(empty.Trimmed().Empty());
+    EXPECT_EQ(empty.Begin(), 0);
+    EXPECT_EQ(empty.End(), 0);
+
+    const std::string   input = "prefix   suffix";
+    const TypeNameSlice root(input);
+    const auto          whitespace = root.Substr(6, 3).Trimmed();
+    EXPECT_TRUE(whitespace.Empty());
+    EXPECT_EQ(whitespace.Begin(), 9);
+    EXPECT_EQ(whitespace.End(), 9);
+
+    const auto at_end = root.Substr(root.Size());
+    EXPECT_TRUE(at_end.Empty());
+    EXPECT_EQ(at_end.Begin(), input.size());
+    EXPECT_EQ(at_end.End(), input.size());
+}
+
+TEST(TypeNameAssemblyReferenceParserTest, ReturnsNoReferencesForUnqualifiedTypes)
+{
+    for (const auto* input : {"", "Type", "Type[][,,]*&", "Outer`1[Inner[]]"})
+    {
+        SCOPED_TRACE(input);
+        EXPECT_TRUE(ParseTypeNameAssemblyReferences(input).empty());
+    }
+}
+
+TEST(TypeNameAssemblyReferenceParserTest, BorrowsVersionFromOriginalInputAcrossReferenceCopies)
+{
+    const std::string input      = "Type, Assembly, Version=1.2";
+    auto              references = ParseTypeNameAssemblyReferences(input);
+    ASSERT_EQ(references.size(), 1);
+    auto reference = references.front();
+    references.clear();
+
+    // The owned assembly name is independent of the borrowed version. Copying a reference retains the original
+    // source, whose storage remains alive and unchanged for the duration of this test.
+    reference.assembly_name.assign(100, 'A');
+    ASSERT_TRUE(reference.version_slice);
+    EXPECT_EQ(reference.version_slice->View(), "1.2");
+    EXPECT_EQ(reference.version_slice->Begin(), input.find("1.2"));
+    EXPECT_EQ(reference.version_slice->View().data(), input.data() + input.find("1.2"));
+}
+
+TEST(TypeNameAssemblyReferenceParserTest, DistinguishesMissingVersionFromEmptyVersion)
+{
+    const std::string missing    = "Type, Assembly";
+    const std::string empty      = "Type, Assembly, Version=   ";
+    auto              references = ParseTypeNameAssemblyReferences(missing);
+    ASSERT_EQ(references.size(), 1);
+    EXPECT_FALSE(references[0].version_slice);
+
+    references = ParseTypeNameAssemblyReferences(empty);
+    ASSERT_EQ(references.size(), 1);
+    ASSERT_TRUE(references[0].version_slice);
+    EXPECT_TRUE(references[0].version_slice->Empty());
+    EXPECT_EQ(references[0].version_slice->Begin(), empty.find('=') + 1);
+    EXPECT_EQ(references[0].version_slice->End(), empty.find('=') + 1);
+}
+
+TEST(TypeNameAssemblyReferenceParserTest, CollectsNestedReferencesWithOriginalOffsets)
+{
+    // The unqualified middle type still contains a qualified leaf. Array suffixes must not contribute references
+    // or allow their commas to become assembly separators at an enclosing level.
+    const std::string input = "Outer`2[Middle`1[[Leaf[][,,], LeafAsm, Version=1.2]],[Right[,], RightAsm]][][][,,]&, "
+                              "OuterAsm, Version=2.0";
+    auto              references = ParseTypeNameAssemblyReferences(input);
+    ASSERT_EQ(references.size(), 3);
+    // Compare by source position: traversal order is not part of the parser's contract.
+    std::sort(references.begin(), references.end(),
+              [](const auto& left, const auto& right) { return left.insert_version_at < right.insert_version_at; });
+    EXPECT_EQ(references[0].assembly_name, "LeafAsm");
+    EXPECT_EQ(references[1].assembly_name, "RightAsm");
+    EXPECT_EQ(references[2].assembly_name, "OuterAsm");
+    EXPECT_EQ(references[0].insert_version_at, input.find("LeafAsm") + std::string_view("LeafAsm").size());
+    EXPECT_EQ(references[1].insert_version_at, input.find("RightAsm") + std::string_view("RightAsm").size());
+    EXPECT_EQ(references[2].insert_version_at, input.find("OuterAsm") + std::string_view("OuterAsm").size());
+    ASSERT_TRUE(references[0].version_slice);
+    EXPECT_EQ(references[0].version_slice->Begin(), input.find("1.2"));
+    EXPECT_EQ(references[0].version_slice->View(), "1.2");
+    EXPECT_FALSE(references[1].version_slice);
+    ASSERT_TRUE(references[2].version_slice);
+    EXPECT_EQ(references[2].version_slice->Begin(), input.find("2.0"));
+    EXPECT_EQ(references[2].version_slice->View(), "2.0");
+}
+
+TEST(TypeNameAssemblyReferenceParserTest, CollectsEveryReferenceInWideArgumentList)
+{
+    constexpr size_t argument_count = 1024;
+    std::string      input          = "Wide`1024[";
+    for (size_t index = 0; index < argument_count; index++)
+    {
+        if (index != 0)
+        {
+            input += ',';
+        }
+        input += "[Type, Assembly" + std::to_string(index) + "]";
+    }
+    input += "]";
+
+    auto references = ParseTypeNameAssemblyReferences(input);
+    ASSERT_EQ(references.size(), argument_count);
+    std::sort(references.begin(), references.end(),
+              [](const auto& left, const auto& right) { return left.insert_version_at < right.insert_version_at; });
+    for (size_t index = 0; index < argument_count; index++)
+    {
+        EXPECT_EQ(references[index].assembly_name, "Assembly" + std::to_string(index));
+    }
+}
+
+TEST(TypeNameAssemblyReferenceParserTest, RejectsClosingBracketOutsideInputView)
+{
+    const std::string backing = "Outer`1[[Leaf, LeafAsm]]";
+    EXPECT_THROW(ParseTypeNameAssemblyReferences(std::string_view(backing.data(), backing.size() - 1)),
+                 TypeNameParseError);
+
+    // No sentinel or closing bracket exists beyond this exact-size buffer.
+    const char unterminated[] = {'T', '['};
+    EXPECT_THROW(ParseTypeNameAssemblyReferences(std::string_view(unterminated, sizeof(unterminated))),
+                 TypeNameParseError);
+}
+
+TEST(TypeNameAssemblyReferenceParserTest, BoundsOriginalInputBytesBeforeTrimming)
+{
+    const std::string suffix = ", Assembly";
+    std::string       input(max_type_name_bytes - suffix.size(), 'T');
+    input += suffix;
+    auto references = ParseTypeNameAssemblyReferences(input);
+    ASSERT_EQ(references.size(), 1);
+    EXPECT_EQ(references[0].assembly_name, "Assembly");
+
+    // Whitespace that would disappear during trimming still consumes the original-input byte budget.
+    input += ' ';
+    EXPECT_THROW(ParseTypeNameAssemblyReferences(input), TypeNameParseError);
+}
+
+TEST(TypeNameAssemblyReferenceParserTest, BoundsConsecutiveBracketGroups)
+{
+    std::string input = "Type";
+    for (size_t index = 0; index < max_bracket_groups; index++)
+    {
+        input += "[]";
+    }
+    input += ", Assembly";
+    auto references = ParseTypeNameAssemblyReferences(input);
+    ASSERT_EQ(references.size(), 1);
+
+    input.insert(input.find(','), "[]");
+    EXPECT_THROW(ParseTypeNameAssemblyReferences(input), TypeNameParseError);
+}
+
+TEST(TypeNameAssemblyReferenceParserTest, BoundsNestedBracketGroups)
+{
+    const auto input       = WrapInGenericTypes("Leaf, LeafAsm", max_bracket_groups / 2);
+    const auto over_budget = "Outer`1[[" + input + "]]";
+    auto       references  = ParseTypeNameAssemblyReferences(input);
+    ASSERT_EQ(references.size(), 1);
+    EXPECT_EQ(references[0].assembly_name, "LeafAsm");
+    EXPECT_THROW(ParseTypeNameAssemblyReferences(over_budget), TypeNameParseError);
+}
+
+TEST(TypeNameAssemblyReferenceParserTest, CountsUnmatchedOpeningsInIgnoredTail)
+{
+    // An empty qualification normally ignores this tail, but its unmatched openings still allocate indexer state.
+    const auto input = std::string("Type, ,") + std::string(max_bracket_groups + 1, '[');
+    EXPECT_THROW(ParseTypeNameAssemblyReferences(input), TypeNameParseError);
+}
+
+TEST(TypeNameAssemblyReferenceParserTest, DoesNotCountEscapedBracketsAsGroups)
+{
+    std::string input = "Type";
+    for (size_t index = 0; index <= max_bracket_groups; index++)
+    {
+        input += "\\[\\]";
+    }
+    input += ", Assembly";
+    auto references = ParseTypeNameAssemblyReferences(input);
+    ASSERT_EQ(references.size(), 1);
+    EXPECT_EQ(references[0].assembly_name, "Assembly");
+}
+
+TEST(TypeNameAssemblyReferenceParserTest, BoundsWorkForWideUnqualifiedLists)
+{
+    // Only one bracket group is needed to queue many arguments. The root consumes one scheduled type; splitting
+    // its argument list adds no charge, so the remaining budget is available to argument types. The first argument
+    // also has an array suffix, which must remain processable after scheduling has consumed the entire budget.
+    for (const auto argument_count : {max_scheduled_types - 1, max_scheduled_types})
+    {
+        std::string input = "Wide`" + std::to_string(argument_count) + "[T[]";
+        for (size_t index = 1; index < argument_count; index++)
+        {
+            input += ",T";
+        }
+        input += "], Assembly";
+        const auto expected_success = argument_count == max_scheduled_types - 1;
+        if (expected_success)
+        {
+            const auto references = ParseTypeNameAssemblyReferences(input);
+            ASSERT_EQ(references.size(), 1);
+            EXPECT_EQ(references[0].assembly_name, "Assembly");
+        }
+        else
+        {
+            // The outer reference cannot be returned when scheduling exceeds the budget.
+            EXPECT_THROW(ParseTypeNameAssemblyReferences(input), TypeNameParseError);
+        }
+    }
+}
 
 // Name-rewriter tests cover supported reflection type-name forms. For a given input and redirection map, they validate:
 // - whether a rewrite happened,
@@ -275,14 +516,14 @@ TEST(TypeNameAssemblyRedirectionRewriterTest, RewritesMappedAssembliesAtEveryGen
     EXPECT_EQ(redirects.at(outer_assembly_name).VersionStr(), WStr("13.0.0.0"));
 }
 
-TEST(TypeNameAssemblyRedirectionRewriterTest, RewritesAtMaximumGenericNestingDepth)
+TEST(TypeNameAssemblyRedirectionRewriterTest, RewritesDeeplyNestedType)
 {
     const WSTRING                                           assembly_name = WStr("Test.Redirected.Assembly");
     std::unordered_map<WSTRING, AssemblyVersionRedirection> redirects     = {{assembly_name, {11, 0, 0, 0}}};
     const auto                                              input_type_name =
-        WrapInGenericTypes("Test.Type, Test.Redirected.Assembly, Version=1.0.0.0", max_generic_nesting_depth);
+        WrapInGenericTypes("Test.Type[], Test.Redirected.Assembly, Version=1.0.0.0", deep_generic_nesting_depth);
     const auto expected_type_name =
-        WrapInGenericTypes("Test.Type, Test.Redirected.Assembly, Version=11.0.0.0", max_generic_nesting_depth);
+        WrapInGenericTypes("Test.Type[], Test.Redirected.Assembly, Version=11.0.0.0", deep_generic_nesting_depth);
     std::string          rewritten_type_name;
     std::vector<WSTRING> rewritten_assembly_names;
 
@@ -293,12 +534,12 @@ TEST(TypeNameAssemblyRedirectionRewriterTest, RewritesAtMaximumGenericNestingDep
     EXPECT_EQ(redirects.at(assembly_name).VersionStr(), WStr("11.0.0.0"));
 }
 
-TEST(TypeNameAssemblyRedirectionRewriterTest, RejectsTypeNameBeyondMaximumGenericNestingDepth)
+TEST(TypeNameAssemblyRedirectionRewriterTest, RejectsTypeNameBeyondBracketBudget)
 {
     const WSTRING                                           assembly_name = WStr("Test.Redirected.Assembly");
     std::unordered_map<WSTRING, AssemblyVersionRedirection> redirects     = {{assembly_name, {11, 0, 0, 0}}};
     const auto                                              input_type_name =
-        WrapInGenericTypes("Test.Type, Test.Redirected.Assembly, Version=1.0.0.0", max_generic_nesting_depth + 1);
+        WrapInGenericTypes("Test.Type, Test.Redirected.Assembly, Version=1.0.0.0", max_bracket_groups / 2 + 1);
     std::string          rewritten_type_name;
     std::vector<WSTRING> rewritten_assembly_names;
 
@@ -580,6 +821,23 @@ TEST(TypeNameAssemblyRedirectionRewriterTest, RejectsMalformedTypeSyntax)
         EXPECT_TRUE(rewritten_assembly_names.empty());
         EXPECT_EQ(redirects.at(assembly_name).VersionStr(), WStr("11.0.0.0"));
     }
+}
+
+TEST(TypeNameAssemblyRedirectionRewriterTest, ContainsParserExceptionAfterParsingOuterQualification)
+{
+    // The parser recognizes OuterAsm before rejecting the nested argument's trimmed dangling escape. Neither
+    // the exception nor a partial rewrite may escape the rewriter boundary, including previously supplied output.
+    const std::string                                       input                    = "Outer`1[[Leaf\\ ]], OuterAsm";
+    const WSTRING                                           assembly_name            = WStr("OuterAsm");
+    std::unordered_map<WSTRING, AssemblyVersionRedirection> redirects                = {{assembly_name, {11, 0, 0, 0}}};
+    std::string                                             rewritten_type_name      = "previous output";
+    std::vector<WSTRING>                                    rewritten_assembly_names = {assembly_name};
+
+    EXPECT_FALSE(
+        TryRewriteTypeNameAssemblyRedirections(input, redirects, rewritten_type_name, rewritten_assembly_names));
+    EXPECT_TRUE(rewritten_type_name.empty());
+    EXPECT_TRUE(rewritten_assembly_names.empty());
+    EXPECT_EQ(redirects.at(assembly_name).VersionStr(), WStr("11.0.0.0"));
 }
 
 TEST(TypeNameAssemblyRedirectionRewriterTest, RewritesLowerAndPreservesHigherVersion)

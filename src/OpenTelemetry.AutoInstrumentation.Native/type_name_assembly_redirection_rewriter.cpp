@@ -77,8 +77,14 @@ bool TryRewriteTypeNameAssemblyRedirections(const std::string_view              
     redirected_assembly_names.clear();
 
     std::vector<ParsedAssemblyReference> references;
-    if (!ParseTypeNameAssemblyReferences(type_name, references))
+    try
     {
+        references = ParseTypeNameAssemblyReferences(type_name);
+    }
+    catch (const TypeNameParseError&)
+    {
+        // Untrusted metadata can be malformed or exceed parser budgets. Leave the attribute unchanged rather
+        // than allowing a parser rejection to escape into the instrumented application's profiler callback.
         return false;
     }
 
@@ -93,7 +99,7 @@ bool TryRewriteTypeNameAssemblyRedirections(const std::string_view              
     for (const auto& reference : references)
     {
         ASSEMBLYMETADATA parsed_version{};
-        if (reference.version_span && !TryParseVersion(reference.version_span->View(type_name), parsed_version))
+        if (reference.version_slice && !TryParseVersion(reference.version_slice->View(), parsed_version))
         {
             return false;
         }
@@ -107,7 +113,7 @@ bool TryRewriteTypeNameAssemblyRedirections(const std::string_view              
         }
         if (redirect != assembly_redirects.end())
         {
-            if (reference.version_span && redirect->second.CompareToAssemblyVersion(parsed_version) <= 0)
+            if (reference.version_slice && redirect->second.CompareToAssemblyVersion(parsed_version) <= 0)
             {
                 // Preserve equal or higher requests. In particular, do not redirect a higher application request
                 // downward to the profiler's configured version.
@@ -115,7 +121,7 @@ bool TryRewriteTypeNameAssemblyRedirections(const std::string_view              
             }
 
             const auto target_version = ToString(redirect->second.VersionStr());
-            if (!reference.version_span)
+            if (!reference.version_slice)
             {
                 // An explicit version prevents a lower TPA copy from binding before the managed resolver can
                 // participate.
@@ -124,8 +130,9 @@ bool TryRewriteTypeNameAssemblyRedirections(const std::string_view              
             }
             else
             {
-                edits.push_back(
-                    {reference.version_span->begin, reference.version_span->end, target_version, redirect->first});
+                // Convert borrowed slices to original-input edit offsets before constructing the output string.
+                edits.push_back({reference.version_slice->Begin(), reference.version_slice->End(), target_version,
+                                 redirect->first});
             }
         }
     }
